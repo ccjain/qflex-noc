@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/curserai_workspace/QFlexController/QFlex-Dispenser_working/**)",
+      "Read(//d/curserai_workspace/QFlexController/**)"
+    ]
+  }
+}

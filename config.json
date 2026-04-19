@@ -1,0 +1,40 @@
+{
+  "charger_id": "QNCH-BOX-001",
+  "firmware_version": "1.0.0",
+  "model": "DCFastCharger-v1",
+  "noc_server": {
+    "host": "d1ve5fr135p56i.cloudfront.net",
+    "port": 443,
+    "_comment": "Set host to EC2 public IP or domain for production. localhost = test against local noc_backend"
+  },
+  "charger_ip": "localhost",
+  "_comment_charger_ip": [
+    "IP address of the QFlex charger whose APIs to collect from.",
+    "  'localhost'      → NocEngine is running ON the charger itself (production)",
+    "  '172.16.14.123'  → NocEngine is running on your Windows PC, charger is at that static IP (testing)",
+    "This single field controls ALL three service URLs (ports 8003, 8002, 8006)."
+  ],
+  "charger_ports": {
+    "system_api": 8000,
+    "charging_controller": 8003,
+    "allocation_engine": 8002,
+    "error_generation": 8006,
+    "_comment": "Change only if charger services run on non-standard ports"
+  },
+  "telemetry": {
+    "interval_seconds": 30,
+    "_comment": "How often to push charger status to NOC server (seconds)"
+  },
+  "heartbeat": {
+    "interval_seconds": 10,
+    "_comment": "Keep-alive ping interval (seconds)"
+  },
+  "reconnect": {
+    "max_delay_seconds": 60,
+    "_comment": "Exponential backoff caps at this value: 5s→10s→20s→40s→60s"
+  },
+  "logging": {
+    "level": "DEBUG",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  }
+}
