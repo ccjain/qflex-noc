@@ -45,7 +45,17 @@ class WSClient:
 
     @property
     def connected(self) -> bool:
-        return self._connected and self._ws is not None
+        if not self._connected or self._ws is None:
+            return False
+        # websockets >=13 uses ClientConnection with .state
+        if hasattr(self._ws, "state"):
+            try:
+                from websockets.protocol import State
+                return self._ws.state is State.OPEN
+            except Exception:
+                pass
+        # Legacy WebSocketClientProtocol uses .open
+        return getattr(self._ws, "open", False)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -54,8 +64,8 @@ class WSClient:
     async def connect(self):
         """Open WebSocket connection to the NOC server."""
         kwargs = dict(
-            ping_interval=20,       # Keep-alive pings every 20s
-            ping_timeout=10,        # Fail connection if no pong within 10s
+            ping_interval=20,       # Keep-alive pings every 20s (keeps NAT/ELB alive)
+            ping_timeout=None,      # Do NOT close if the server doesn't pong
             close_timeout=5,
             max_size=2 * 1024 * 1024,  # 2 MB max message size
         )

@@ -191,7 +191,7 @@ async def _fetch_charger_id() -> str:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    serial = data.get("value", "").strip()
+                    serial = data.get("value", "").replace("\x00", "").strip()
                     if data.get("success") and serial:
                         ocpp_serial = serial
                         logger.info(f"[NocEngine] ✅ OCPP serial: {ocpp_serial}")
@@ -207,7 +207,7 @@ async def _fetch_charger_id() -> str:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    serial = str(data.get("serial_number", "")).strip()
+                    serial = str(data.get("serial_number", "")).replace("\x00", "").strip()
                     if data.get("success") and serial:
                         hw_serial = serial
                         logger.info(f"[NocEngine] ✅ HW serial  : {hw_serial}")

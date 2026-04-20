@@ -277,7 +277,7 @@ class NocEngine:
                         ) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                serial = data.get("value", "").strip()
+                                serial = data.get("value", "").replace("\x00", "").strip()
                                 if data.get("success") and serial:
                                     ocpp_serial = serial
                     except Exception as e:
@@ -292,7 +292,7 @@ class NocEngine:
                         ) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                serial = str(data.get("serial_number", "")).strip()
+                                serial = str(data.get("serial_number", "")).replace("\x00", "").strip()
                                 if data.get("success") and serial:
                                     hw_serial = serial
                     except Exception as e:
