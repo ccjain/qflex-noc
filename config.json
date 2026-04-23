@@ -3,8 +3,8 @@
   "firmware_version": "1.0.0",
   "model": "DCFastCharger-v1",
   "noc_server": {
-    "host": "d1ve5fr135p56i.cloudfront.net",
-    "port": 443,
+    "host": "54.226.223.3",
+    "port": 8001,
     "_comment": "Set host to EC2 public IP or domain for production. localhost = test against local noc_backend"
   },
   "charger_ip": "localhost",
