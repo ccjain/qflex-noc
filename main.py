@@ -81,36 +81,54 @@ from noc_engine import NocEngine
 CHARGER_ID_CACHE_FILE = config_path.parent / "charger_id_cache.json"
 
 
-def _load_cached_charger_id() -> str | None:
-    """Load charger_id from persistent cache file."""
+def _read_cache() -> dict:
+    """Read the runtime-discovered cache file. Returns {} on any error."""
     if not CHARGER_ID_CACHE_FILE.exists():
-        return None
+        return {}
     try:
         with open(CHARGER_ID_CACHE_FILE, "r") as f:
-            data = json.load(f)
-        ocpp = data.get("ocpp_serial", "").strip()
-        hw = data.get("hw_serial", "").strip()
-        if ocpp and hw:
-            return f"{ocpp}-{hw}"
+            return json.load(f) or {}
     except Exception as e:
-        logger.warning(f"[NocEngine] Failed to load cached charger ID: {e}")
+        logger.warning(f"[NocEngine] Failed to read cache: {e}")
+        return {}
+
+
+def _write_cache(updates: dict) -> None:
+    """Merge `updates` into the cache file (preserves other fields)."""
+    data = _read_cache()
+    data.update(updates)
+    data["timestamp"] = datetime.now(timezone.utc).isoformat()
+    try:
+        with open(CHARGER_ID_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"[NocEngine] Failed to write cache: {e}")
+
+
+def _load_cached_charger_id() -> str | None:
+    """Load charger_id from persistent cache file."""
+    data = _read_cache()
+    ocpp = str(data.get("ocpp_serial", "")).strip()
+    hw   = str(data.get("hw_serial", "")).strip()
+    if ocpp and hw:
+        return f"{ocpp}-{hw}"
     return None
 
 
 def _save_cached_charger_id(ocpp_serial: str, hw_serial: str) -> None:
     """Save charger ID components to persistent cache file."""
-    try:
-        with open(CHARGER_ID_CACHE_FILE, "w") as f:
-            json.dump(
-                {
-                    "ocpp_serial": ocpp_serial,
-                    "hw_serial": hw_serial,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                f,
-            )
-    except Exception as e:
-        logger.warning(f"[NocEngine] Failed to save cached charger ID: {e}")
+    _write_cache({"ocpp_serial": ocpp_serial, "hw_serial": hw_serial})
+
+
+def _load_cached_noc_url() -> str | None:
+    """Load NOC URL from persistent cache file."""
+    url = str(_read_cache().get("noc_url", "")).strip()
+    return url or None
+
+
+def _save_cached_noc_url(noc_url: str) -> None:
+    """Save NOC URL to persistent cache file."""
+    _write_cache({"noc_url": noc_url})
 
 
 # ---------------------------------------------------------------------------
@@ -253,12 +271,21 @@ async def _main():
     charger_id = await _fetch_charger_id()
     config["charger_id"] = charger_id
 
-    # 1b. Fetch dynamic NOC URL from local API (fallback to config.json)
+    # 1b. Fetch dynamic NOC URL from local API.
+    #     Fallback chain: API → cache → config.json (host/port).
     noc_url = await _fetch_noc_url()
     if noc_url:
+        _save_cached_noc_url(noc_url)
         config.setdefault("noc_server", {})["url"] = noc_url
     else:
-        logger.warning("[NocEngine] Falling back to NOC server from config.json")
+        cached_url = _load_cached_noc_url()
+        if cached_url:
+            logger.warning(
+                f"[NocEngine] ⚠️ NOC URL API unavailable — using cached URL: {cached_url}"
+            )
+            config.setdefault("noc_server", {})["url"] = cached_url
+        else:
+            logger.warning("[NocEngine] Falling back to NOC server from config.json")
 
     # 2. Startup banner (printed after charger_id is confirmed)
     logger.info("=" * 60)

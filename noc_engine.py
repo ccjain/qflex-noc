@@ -62,16 +62,14 @@ class NocEngine:
 
         # NOC server connection
         noc_cfg = config.get("noc_server", {})
-        noc_url = noc_cfg.get("url")
-        if noc_url:
-            self.noc_host = noc_url
-            self.noc_port = 443 if noc_url.startswith("wss://") else 80
-            self.ws_uri   = f"{noc_url.rstrip('/')}/ws/{self.charger_id}"
+        self.noc_url: str | None = noc_cfg.get("url")
+        if self.noc_url:
+            self.noc_host = self.noc_url
+            self.noc_port = 443 if self.noc_url.startswith("wss://") else 80
         else:
             self.noc_host = noc_cfg.get("host", "localhost")
             self.noc_port = noc_cfg.get("port", 8080)
-            scheme        = "wss" if self.noc_port == 443 else "ws"
-            self.ws_uri   = f"{scheme}://{self.noc_host}:{self.noc_port}/ws/{self.charger_id}"
+        self.ws_uri = self._build_ws_uri()
 
         # Intervals
         self.telemetry_interval  = config.get("telemetry", {}).get("interval_seconds", 30)
@@ -109,6 +107,7 @@ class NocEngine:
             f"/api/v1/config/ocpp/charge_box_serial_number"
         )
         self._hw_serial_url = f"http://{self.charger_ip}:{sys_port}/api/v1/system/hardware"
+        self._noc_url_url   = f"http://{self.charger_ip}:{cc_port}/api/v1/config/ocpp/NocURL"
         self._charger_id_cache_file = Path(charger_id_cache_file) if charger_id_cache_file else Path(__file__).parent / "charger_id_cache.json"
 
         self._running = False
@@ -123,6 +122,31 @@ class NocEngine:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _build_ws_uri(self) -> str:
+        """Build the WebSocket URI from current noc_url (or host/port) + charger_id."""
+        if self.noc_url:
+            return f"{self.noc_url.rstrip('/')}/ws/{self.charger_id}"
+        scheme = "wss" if self.noc_port == 443 else "ws"
+        return f"{scheme}://{self.noc_host}:{self.noc_port}/ws/{self.charger_id}"
+
+    def _save_cache(self, updates: dict) -> None:
+        """Merge `updates` into the runtime cache file (preserves other fields)."""
+        try:
+            data: dict = {}
+            if self._charger_id_cache_file.exists():
+                with open(self._charger_id_cache_file, "r") as f:
+                    data = json.load(f) or {}
+        except Exception as e:
+            logger.debug(f"[NOC-Engine] Cache read failed (will overwrite): {e}")
+            data = {}
+        data.update(updates)
+        data["timestamp"] = self._now_iso()
+        try:
+            with open(self._charger_id_cache_file, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"[NOC-Engine] Failed to save cache: {e}")
 
     def _ssl_context(self):
         """Return an SSL context for WSS connections."""
@@ -255,7 +279,13 @@ class NocEngine:
                 break
 
     async def _charger_id_refresh_loop(self, ws: WSClient):
-        """Poll local APIs every 10s to refresh charger ID and update cache."""
+        """
+        Poll local APIs every 10s to refresh charger ID and update cache.
+
+        On change: persist to cache, rebuild ws_uri, then RETURN. Returning
+        wakes the asyncio.wait(FIRST_COMPLETED) in run(), which cancels the
+        sibling tasks and reconnects with the new charger_id.
+        """
         import aiohttp
 
         REFRESH_INTERVAL = 10
@@ -263,7 +293,7 @@ class NocEngine:
         while True:
             await asyncio.sleep(REFRESH_INTERVAL)
             if not ws.connected:
-                break
+                return
 
             ocpp_serial: str | None = None
             hw_serial: str | None = None
@@ -302,36 +332,67 @@ class NocEngine:
             except Exception as e:
                 logger.debug(f"[NOC-Engine] Charger ID refresh error: {e}")
 
-            if ocpp_serial and hw_serial:
-                # Save to cache
-                try:
-                    with open(self._charger_id_cache_file, "w") as f:
-                        json.dump(
-                            {
-                                "ocpp_serial": ocpp_serial,
-                                "hw_serial": hw_serial,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            },
-                            f,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"[NOC-Engine] Failed to save charger ID cache: {e}"
-                    )
+            if not (ocpp_serial and hw_serial):
+                continue
 
-                new_charger_id = f"{ocpp_serial}-{hw_serial}"
-                if new_charger_id != self.charger_id:
-                    logger.info(
-                        f"[NOC-Engine] Charger ID updated: {self.charger_id} → {new_charger_id}"
-                    )
-                    self.charger_id = new_charger_id
-                    # Rebuild WS URI so next reconnect uses the new ID
-                    if self.ws_uri.startswith("wss://"):
-                        base = self.ws_uri.rsplit("/", 1)[0]
-                        self.ws_uri = f"{base}/{self.charger_id}"
-                    else:
-                        base = self.ws_uri.rsplit("/", 1)[0]
-                        self.ws_uri = f"{base}/{self.charger_id}"
+            # Always refresh cache so the latest values are the fallback
+            self._save_cache({"ocpp_serial": ocpp_serial, "hw_serial": hw_serial})
+
+            new_charger_id = f"{ocpp_serial}-{hw_serial}"
+            if new_charger_id != self.charger_id:
+                logger.info(
+                    f"[NOC-Engine] Charger ID changed: {self.charger_id} → {new_charger_id} — reconnecting"
+                )
+                self.charger_id = new_charger_id
+                self.ws_uri = self._build_ws_uri()
+                return  # triggers reconnect in run()
+
+    async def _noc_url_refresh_loop(self, ws: WSClient):
+        """
+        Poll local API every 10s to refresh the NOC server URL and update cache.
+
+        On change: persist to cache, rebuild ws_uri, then RETURN to trigger a
+        reconnect to the new URL.
+        """
+        import aiohttp
+
+        REFRESH_INTERVAL = 10
+
+        while True:
+            await asyncio.sleep(REFRESH_INTERVAL)
+            if not ws.connected:
+                return
+
+            new_url: str | None = None
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        self._noc_url_url,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            url = str(data.get("value", "")).strip()
+                            if data.get("success") and url:
+                                new_url = url
+            except Exception as e:
+                logger.debug(f"[NOC-Engine] NOC URL refresh error: {e}")
+
+            if not new_url:
+                continue
+
+            # Always refresh cache so the latest URL is the fallback
+            self._save_cache({"noc_url": new_url})
+
+            if new_url != self.noc_url:
+                logger.info(
+                    f"[NOC-Engine] NOC URL changed: {self.noc_url} → {new_url} — reconnecting"
+                )
+                self.noc_url  = new_url
+                self.noc_host = new_url
+                self.noc_port = 443 if new_url.startswith("wss://") else 80
+                self.ws_uri   = self._build_ws_uri()
+                return  # triggers reconnect in run()
 
     async def _session_sync_loop(self, ws: WSClient):
         """Collect and push session data every 30 seconds."""
@@ -843,6 +904,7 @@ class NocEngine:
                     asyncio.create_task(self._heartbeat_loop(ws),           name="heartbeat"),
                     asyncio.create_task(self._session_sync_loop(ws),        name="session_sync"),
                     asyncio.create_task(self._charger_id_refresh_loop(ws),  name="charger_id_refresh"),
+                    asyncio.create_task(self._noc_url_refresh_loop(ws),     name="noc_url_refresh"),
                 ]
 
                 # Fire and forget version poll (it self-terminates after 5 polls)

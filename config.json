@@ -1,6 +1,6 @@
 {
   "charger_id": "QNCH-BOX-001",
-  "firmware_version": "1.0.0",
+  "firmware_version": "1.1.0",
   "model": "DCFastCharger-v1",
   "noc_server": {
     "host": "54.226.223.3",
