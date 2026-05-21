@@ -129,6 +129,33 @@ def _save_cached_noc_url(noc_url: str) -> None:
     _write_cache({"noc_url": noc_url})
 
 
+def _parse_enabled(value) -> bool:
+    """Parse the nocServerEnabled API value into a strict bool.
+
+    Truthy: True, "true"/"True"/"TRUE", "1", 1. Everything else → False.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1")
+    return False
+
+
+def _load_cached_noc_enabled() -> bool | None:
+    """Load nocServerEnabled from persistent cache file. Returns None if absent."""
+    raw = _read_cache().get("noc_enabled")
+    if raw is None:
+        return None
+    return bool(raw)
+
+
+def _save_cached_noc_enabled(enabled: bool) -> None:
+    """Save nocServerEnabled state to persistent cache file."""
+    _write_cache({"noc_enabled": bool(enabled)})
+
+
 # ---------------------------------------------------------------------------
 # Charger ID resolution — tries APIs once, falls back to cache, no blocking
 # ---------------------------------------------------------------------------
@@ -164,6 +191,46 @@ async def _fetch_noc_url() -> str | None:
                     logger.warning(f"[NocEngine] NOC URL fetch failed: HTTP {resp.status}")
     except Exception as e:
         logger.warning(f"[NocEngine] NOC URL fetch error: {e}")
+
+    return None
+
+
+async def _fetch_noc_enabled() -> bool | None:
+    """
+    Fetch nocServerEnabled flag from the local charging_controller API.
+
+    Endpoint: GET /api/v1/config/ocpp/nocServerEnabled
+    Returns True/False if the API answered with success=True, otherwise None.
+    """
+    import aiohttp
+
+    charger_ip = config.get("charger_ip", "localhost")
+    cc_port    = config.get("charger_ports", {}).get("charging_controller", 8003)
+    url        = f"http://{charger_ip}:{cc_port}/api/v1/config/ocpp/nocServerEnabled"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data    = await resp.json()
+                    if data.get("success"):
+                        enabled = _parse_enabled(data.get("value"))
+                        logger.info(
+                            f"[NocEngine] ✅ NOC enabled: {enabled} "
+                            f"(value={data.get('value')!r})"
+                        )
+                        return enabled
+                    logger.warning(
+                        f"[NocEngine] nocServerEnabled unsuccessful: {data}"
+                    )
+                else:
+                    logger.warning(
+                        f"[NocEngine] nocServerEnabled fetch failed: HTTP {resp.status}"
+                    )
+    except Exception as e:
+        logger.warning(f"[NocEngine] nocServerEnabled fetch error: {e}")
 
     return None
 
@@ -289,6 +356,26 @@ async def _main():
         else:
             logger.warning("[NocEngine] Falling back to NOC server from config.json")
 
+    # 1c. Fetch nocServerEnabled flag.
+    #     Fallback chain: API → cache → default True (fail-open).
+    fetched_enabled = await _fetch_noc_enabled()
+    if fetched_enabled is not None:
+        _save_cached_noc_enabled(fetched_enabled)
+        config.setdefault("noc_server", {})["enabled"] = fetched_enabled
+    else:
+        cached_enabled = _load_cached_noc_enabled()
+        if cached_enabled is not None:
+            logger.warning(
+                f"[NocEngine] ⚠️ nocServerEnabled API unavailable — "
+                f"using cached value: {cached_enabled}"
+            )
+            config.setdefault("noc_server", {})["enabled"] = cached_enabled
+        else:
+            logger.warning(
+                "[NocEngine] nocServerEnabled API + cache unavailable — defaulting to enabled=True"
+            )
+            config.setdefault("noc_server", {})["enabled"] = True
+
     # 2. Startup banner (printed after charger_id is confirmed)
     # KEEP — startup banner; one-shot at boot.
     logger.info("=" * 60)
@@ -303,6 +390,7 @@ async def _main():
         logger.info(f"  NOC Server   : {noc_url} (from API)")
     else:
         logger.info(f"  NOC Server   : {noc.get('host', 'localhost')}:{noc.get('port', 8080)} (from config)")
+    logger.info(f"  NOC enabled  : {noc.get('enabled', True)}")
     charger_ip = config.get("charger_ip", "localhost")
     mode = "ON-CHARGER (production)" if charger_ip == "localhost" else f"REMOTE TEST → {charger_ip}"
     logger.info(f"  Charger IP   : {charger_ip}  [{mode}]")

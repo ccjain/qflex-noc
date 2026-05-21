@@ -4,6 +4,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-05-21
+
+### Added
+
+#### `nocServerEnabled` runtime kill switch
+
+- New boolean flag polled every 30s from `:8003/api/v1/config/ocpp/nocServerEnabled`. When `true`, the engine maintains its NOC WebSocket as before; when `false`, the engine stays alive but holds *no* NOC connectivity. A `false → true` transition wakes the engine and reconnects immediately; a `true → false` transition tears down the live WS within ~1s and parks the run loop on an `asyncio.Event`.
+- **Startup (`main.py`).** `_fetch_noc_enabled()` mirrors `_fetch_noc_url()`: API → cache → fail-open default `True`. The resolved value is injected into `config["noc_server"]["enabled"]` and persisted in `charger_id_cache.json` under `noc_enabled`. New helpers: `_parse_enabled()`, `_load_cached_noc_enabled()`, `_save_cached_noc_enabled()`.
+- **Engine (`noc_engine.py`).** New state: `self.noc_enabled`, `self._noc_enabled_url`, `self._enabled_event`, `self._enabled_refresh_task`, and the `self._rl_noc_enabled` rate-limited error logger. Three new methods: `_parse_enabled_value` (static, strict truthy parser — only `True`/`"true"`/`"1"`/`1` count), `_fetch_noc_enabled_once`, `_noc_enabled_refresh_loop` (engine-lifetime, 30s cadence), and `_enabled_guard_loop` (per-WS, 1s cadence). `run()` now gates on `self.noc_enabled` before each connect attempt and adds the guard to the per-WS task set so a `true → false` flip rides the existing `asyncio.wait(FIRST_COMPLETED)` teardown. `stop()` cancels the refresh task and sets the event so a parked `run()` exits.
+- **Logging.** Steady-state polling is silent; only actual transitions and disable/resume entry log at INFO. Endpoint errors go through `RateLimitedLogger.exception(...)` matching the [[1.1.5]] pattern.
+- **Behavior unchanged when API is absent.** Fail-open (default `True`) preserves all existing connectivity.
+- **Tests.** New `tests/test_noc_engine_enabled_flag.py` (34 tests): constructor defaults, strict-truthy parsing, fetch happy/error paths, refresh-loop transition + steady-state + API-unreachable, guard-loop disable/disconnect/healthy behavior.
+
 ## [1.1.5] — 2026-05-16
 
 ### Changed

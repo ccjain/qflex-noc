@@ -75,6 +75,14 @@ class NocEngine:
             self.noc_port = noc_cfg.get("port", 8080)
         self.ws_uri = self._build_ws_uri()
 
+        # Runtime kill switch — polled every 30s from local API. When False,
+        # the engine stays alive but does not maintain a WS connection.
+        self.noc_enabled: bool = bool(noc_cfg.get("enabled", True))
+        self._enabled_event: asyncio.Event = asyncio.Event()
+        if self.noc_enabled:
+            self._enabled_event.set()
+        self._enabled_refresh_task: asyncio.Task | None = None
+
         # Intervals
         self.telemetry_interval  = config.get("telemetry", {}).get("interval_seconds", 30)
         self.heartbeat_interval  = config.get("heartbeat", {}).get("interval_seconds", 10)
@@ -113,6 +121,9 @@ class NocEngine:
         )
         self._hw_serial_url = f"http://{self.charger_ip}:{sys_port}/api/v1/system/hardware"
         self._noc_url_url   = f"http://{self.charger_ip}:{cc_port}/api/v1/config/ocpp/NocURL"
+        self._noc_enabled_url = (
+            f"http://{self.charger_ip}:{cc_port}/api/v1/config/ocpp/nocServerEnabled"
+        )
         self._charger_id_cache_file = Path(charger_id_cache_file) if charger_id_cache_file else Path(__file__).parent / "charger_id_cache.json"
 
         self._running = False
@@ -156,6 +167,7 @@ class NocEngine:
         self._rl_ocpp_serial = RateLimitedLogger(logger, key="charger_id_refresh/ocpp")
         self._rl_hw_serial   = RateLimitedLogger(logger, key="charger_id_refresh/hw")
         self._rl_noc_url     = RateLimitedLogger(logger, key="noc_url_refresh")
+        self._rl_noc_enabled = RateLimitedLogger(logger, key="noc_enabled_refresh")
 
         # Local HTTP API for version/health introspection
         engine_version = self._read_engine_version()
@@ -517,6 +529,98 @@ class NocEngine:
                 self.noc_port = 443 if new_url.startswith("wss://") else 80
                 self.ws_uri   = self._build_ws_uri()
                 return  # triggers reconnect in run()
+
+    @staticmethod
+    def _parse_enabled_value(value) -> bool:
+        """Parse the nocServerEnabled API value into a strict bool.
+
+        Truthy: True, "true"/"True"/"TRUE", "1", 1. Everything else → False.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value == 1
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1")
+        return False
+
+    async def _fetch_noc_enabled_once(self) -> bool | None:
+        """One-shot fetch of nocServerEnabled. Returns True/False or None on failure."""
+        try:
+            session = await self._ensure_http_session()
+            async with session.get(
+                self._noc_enabled_url,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    self._rl_noc_enabled.exception(
+                        "nocServerEnabled fetch HTTP %s (URL: %s)",
+                        resp.status, self._noc_enabled_url,
+                    )
+                    return None
+                data = await resp.json(content_type=None)
+                if not data.get("success"):
+                    self._rl_noc_enabled.exception(
+                        "nocServerEnabled returned success=False (URL: %s, body=%s)",
+                        self._noc_enabled_url, data,
+                    )
+                    return None
+                self._rl_noc_enabled.ok()
+                return self._parse_enabled_value(data.get("value"))
+        except Exception:
+            self._rl_noc_enabled.exception(
+                "nocServerEnabled refresh failed (URL: %s)", self._noc_enabled_url,
+            )
+            return None
+
+    async def _noc_enabled_refresh_loop(self):
+        """
+        Engine-lifetime loop. Polls the local nocServerEnabled flag every 30s.
+
+        Unlike per-WS refresh loops, this task is spawned ONCE in run() and
+        outlives reconnects. On transition: persist to cache, update state,
+        and set the event so a disabled run() wakes immediately on enable.
+        """
+        REFRESH_INTERVAL = 30
+        while self._running:
+            try:
+                await asyncio.sleep(REFRESH_INTERVAL)
+            except asyncio.CancelledError:
+                return
+            if not self._running:
+                return
+
+            new_enabled = await self._fetch_noc_enabled_once()
+            if new_enabled is None:
+                continue  # API down — keep last state
+
+            self._save_cache({"noc_enabled": new_enabled})
+
+            if new_enabled != self.noc_enabled:
+                # KEEP — fires only on actual change (≈ zero/day in steady state).
+                logger.info(
+                    f"[NOC-Engine] nocServerEnabled changed: "
+                    f"{self.noc_enabled} → {new_enabled}"
+                )
+                self.noc_enabled = new_enabled
+                # Wake run() if it's waiting for re-enable, and let the
+                # per-WS guard loop notice on its next tick.
+                self._enabled_event.set()
+
+    async def _enabled_guard_loop(self, ws: WSClient):
+        """Per-WS guard: if noc_enabled flips false, return to trigger reconnect.
+
+        Exiting feeds asyncio.wait(FIRST_COMPLETED) in run(), which cancels
+        sibling tasks and tears the connection down cleanly. The next iteration
+        of run() finds noc_enabled=False and waits on _enabled_event.
+        """
+        while True:
+            await asyncio.sleep(1)
+            if not ws.connected:
+                return
+            if not self.noc_enabled:
+                logger.info("[NOC-Engine] nocServerEnabled=false — closing WS")
+                return
 
     async def _session_sync_loop(self, ws: WSClient):
         """Collect and push session data every 30 seconds."""
@@ -1170,7 +1274,25 @@ class NocEngine:
                 self._chunked_upload_sweeper_loop(), name="chunk_sweeper"
             )
 
+        # Engine-lifetime poll of the nocServerEnabled kill switch
+        if self._enabled_refresh_task is None or self._enabled_refresh_task.done():
+            self._enabled_refresh_task = asyncio.create_task(
+                self._noc_enabled_refresh_loop(), name="noc_enabled_refresh"
+            )
+
         while self._running:
+            # Kill-switch gate: if disabled, sit on the event until re-enabled.
+            if not self.noc_enabled:
+                logger.info(
+                    "[NOC-Engine] nocServerEnabled=false — sleeping until enabled"
+                )
+                self._enabled_event.clear()
+                await self._enabled_event.wait()
+                if not self._running:
+                    break
+                logger.info("[NOC-Engine] nocServerEnabled=true — resuming")
+                continue
+
             ws = WSClient(self.ws_uri, ssl_context=self._ssl_context())
             try:
                 await ws.connect()
@@ -1187,6 +1309,7 @@ class NocEngine:
                     asyncio.create_task(self._charger_id_refresh_loop(ws),  name="charger_id_refresh"),
                     asyncio.create_task(self._noc_url_refresh_loop(ws),     name="noc_url_refresh"),
                     asyncio.create_task(self._watchdog_loop(ws),            name="watchdog"),
+                    asyncio.create_task(self._enabled_guard_loop(ws),       name="enabled_guard"),
                 ]
 
                 # Fire and forget version poll (it self-terminates after 5 polls)
@@ -1255,6 +1378,12 @@ class NocEngine:
         # Cancel the chunked-upload sweeper
         if self._sweeper_task is not None and not self._sweeper_task.done():
             self._sweeper_task.cancel()
+
+        # Cancel the engine-lifetime nocServerEnabled refresh task and wake
+        # any run() that's parked on the disabled-state event.
+        if self._enabled_refresh_task is not None and not self._enabled_refresh_task.done():
+            self._enabled_refresh_task.cancel()
+        self._enabled_event.set()
 
         # Close all SSH tunnels
         if hasattr(self, '_ssh_manager'):
